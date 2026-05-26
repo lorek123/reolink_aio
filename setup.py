@@ -11,7 +11,7 @@ HERE = pathlib.Path(__file__).parent
 README = (HERE / "README.md").read_text()
 
 setup(name='reolink_aio',
-      version='0.19.0',
+      version='0.19.1',
       description='Reolink NVR/cameras API package',
       long_description=README,
       long_description_content_type="text/markdown",
@@ -29,6 +29,11 @@ setup(name='reolink_aio',
         'pycryptodomex',
         'typing_extensions'
         ],
+      entry_points={
+          "console_scripts": [
+              "reolink-stream-vod=reolink_aio.scripts.stream_vod:main",
+          ],
+      },
       tests_require=[],
       platforms=['any'],
       zip_safe=False,

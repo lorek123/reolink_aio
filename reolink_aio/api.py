@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import calendar
 import hashlib
 import logging
 import re
 import ssl
 import traceback
-from datetime import datetime, timedelta, tzinfo
+from collections.abc import AsyncIterator
+from datetime import date, datetime, timedelta, tzinfo
 from io import BytesIO
 from math import ceil
 from os.path import basename
@@ -284,6 +286,7 @@ class Host:
         self._ptz_patrol_settings: dict[int, dict] = {}
         self._ptz_guard_settings: dict[int, dict] = {}
         self._ptz_position: dict[int, dict] = {}
+        self._ptz_3d_zoom_range: dict[int, dict] = {}
         self._email_settings: dict[int, dict] = {}
         self._ir_settings: dict[int, dict] = {}
         self._status_led_settings: dict[int, dict] = {}
@@ -921,10 +924,10 @@ class Host:
         return self._whiteled_settings.get(channel, {}).get("state", 0) == 1
 
     def whiteled_mode(self, channel: int) -> Optional[int]:
-        if channel not in self._whiteled_settings:
-            return None
-
-        return self._whiteled_settings[channel].get("mode")
+        mode = self._whiteled_settings.get(channel, {}).get("mode")
+        if mode == 6:
+            return SpotlightModeEnum.adaptive.value  # Elite Floodlight WiFi uses 6 as adaptive mode, sending 5 will also set it to 6, so no need for a change there.
+        return mode
 
     def whiteled_mode_list(self, channel: int) -> list[str]:
         mode_values = [SpotlightModeEnum.off]
@@ -1823,9 +1826,11 @@ class Host:
                         self._capabilities[channel].add("focus")
                         if self.api_version("disableAutoFocus", channel) > 0 and channel in self._auto_focus_settings:
                             self._capabilities[channel].add("auto_focus")
-                if ptz_ver in [2, 3, 5]:
+                    if self.api_version("supportPtz3DLocation", channel) > 0:
+                        self._capabilities[channel].add("ptz_3d_zoom")
+                if ptz_ver in [2, 3, 5, 6]:
                     self._capabilities[channel].add("tilt")
-                if ptz_ver in [2, 3, 5, 7]:
+                if ptz_ver in [2, 3, 5, 6, 7]:
                     self._capabilities[channel].add("pan_tilt")
                     self._capabilities[channel].add("pan")
                     if self.api_version("ptzPreset", channel) > 0:
@@ -2002,6 +2007,8 @@ class Host:
                 ch_body = [{"cmd": "GetPtzGuard", "action": 0, "param": {"channel": channel}}]
             elif cmd == "GetPtzCurPos" and self.supported(channel, "ptz_position"):
                 ch_body = [{"cmd": "GetPtzCurPos", "action": 0, "param": {"PtzCurPos": {"channel": channel}}}]
+            elif cmd == "Get3DPos" and self.supported(channel, "ptz_3d_zoom"):
+                ch_body = [{"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}}]
             elif cmd == "GetAiCfg" and self.supported(channel, "auto_track"):
                 ch_body = [{"cmd": "GetAiCfg", "action": 0, "param": {"channel": channel}}]
             elif cmd == "GetPtzTraceSection" and self.supported(channel, "auto_track_limit"):
@@ -2355,7 +2362,7 @@ class Host:
 
     def get_raw_host_data(self) -> str:
         """Get the cache of the host data as a string."""
-        return json_dumps(self._host_data_raw).decode("utf-8")
+        return json_dumps(self._host_data_raw).decode("utf8")
 
     def set_raw_host_data(self, data: str) -> None:
         """Set the cache of the host data using a string."""
@@ -2424,6 +2431,12 @@ class Host:
 
         body = []
         channels = []
+        for channel in self._channels:
+            # Put the GetChnTypeInfo check in the first chunck to check camera online
+            ch_body = [{"cmd": "GetChnTypeInfo", "action": 0, "param": {"channel": channel}}]
+            body.extend(ch_body)
+            channels.extend([channel] * len(ch_body))
+
         for channel in self._stream_channels:
             ch_body = [
                 {"cmd": "GetEnc", "action": 0, "param": {"channel": channel}},
@@ -2434,7 +2447,6 @@ class Host:
 
         for channel in self._channels:
             ch_body = [
-                {"cmd": "GetChnTypeInfo", "action": 0, "param": {"channel": channel}},
                 {"cmd": "GetMdState", "action": 0, "param": {"channel": channel}},
                 {"cmd": "GetAiState", "action": 0, "param": {"channel": channel}},  # to capture AI capabilities
                 {"cmd": "GetEvents", "action": 0, "param": {"channel": channel}},
@@ -2474,6 +2486,8 @@ class Host:
                 ch_body.append({"cmd": "GetPtzPreset", "action": 0, "param": {"channel": channel}})
                 ch_body.append({"cmd": "GetPtzPatrol", "action": 0, "param": {"channel": channel}})
                 ch_body.append({"cmd": "GetPtzGuard", "action": 0, "param": {"channel": channel}})
+            if self.supported(channel, "ptz_3d_zoom"):
+                ch_body.append({"cmd": "Get3DPos", "action": 1, "param": {"channel": channel}})
             if self.supported(channel, "auto_track"):
                 ch_body.append({"cmd": "GetAiCfg", "action": 1, "param": {"channel": channel}})
             if self.api_version("mask", channel) > 0 or self.supported(channel, "privacy_mask_basic"):
@@ -3433,7 +3447,7 @@ class Host:
             return url
 
         # return the first tried URL (based on camera capabilities as above)
-        _LOGGER.error("Host %s:%s, could not verify a working RTSP url for channel %s, stream %s", self._host, self._port, channel, stream)
+        _LOGGER.warning("Host %s:%s, could not verify a working RTSP url for channel %s, stream %s", self._host, self._port, channel, stream)
         return self._rtsp_verified[channel][stream]
 
     async def get_stream_source(self, channel: int, stream: Optional[str] = None, check: bool = True) -> Optional[str]:
@@ -3530,6 +3544,12 @@ class Host:
                 cmd = VodRequestType.DOWNLOAD.value
 
             url = f"{self._url}?cmd={cmd}&source={filename.replace(' ', '%20')}&output=ha_playback_{time_start}.mp4{start_time}"
+        elif request_type == VodRequestType.RTSP:
+            # RTSP playback URL – supported on select Reolink cameras/NVRs.
+            # The credentials are embedded in the URL (same as live RTSP streams).
+            safe_filename = filename.replace(" ", "%20")
+            rtsp_url = f"rtsp://{self._username}:{self._enc_password}@{self._host}:{self._rtsp_port}/vod/{safe_filename}"
+            return ("video/mp4", rtsp_url)
         else:
             raise InvalidParameterError(f"get_vod_source: unsupported request_type '{request_type.value}'")
 
@@ -4112,6 +4132,9 @@ class Host:
                 elif data["cmd"] == "GetAutoFocus":
                     self._auto_focus_settings[channel] = data["value"]["AutoFocus"]
 
+                elif data["cmd"] == "Get3DPos":
+                    self._ptz_3d_zoom_range[channel] = data["value"]["3d_pos"]
+
                 elif data["cmd"] == "GetZoomFocus":
                     zoom = self._zoom_focus_settings.setdefault(channel, {}).setdefault("zoom", {})
                     focus = self._zoom_focus_settings[channel].setdefault("focus", {})
@@ -4417,6 +4440,93 @@ class Host:
         ]
 
         await self.send_setting(body, getcmd="GetZoomFocus", wait_before_get=3)
+
+    def ptz_3d_zoom_range(self, channel: int) -> dict:
+        """Get the stream resolutions for 3D zoom (from Get3DPos).
+
+        Returns dict with mainStream/subStream/extStream, each containing width/height.
+        These values are used as the width/height parameters when calling set_ptz_3d_zoom.
+        """
+        if channel not in self._channels:
+            raise InvalidParameterError(f"ptz_3d_zoom_range: no camera connected to channel '{channel}'")
+        if not self.supported(channel, "ptz_3d_zoom"):
+            raise NotSupportedError(f"ptz_3d_zoom_range: 3D zoom on camera {self.camera_name(channel)} is not available")
+
+        return self._ptz_3d_zoom_range.get(channel, {})
+
+    async def set_ptz_3d_zoom(
+        self,
+        channel: int,
+        pos_x: int,
+        pos_y: int,
+        pos_width: int,
+        pos_height: int,
+        stream_width: int | None = None,
+        stream_height: int | None = None,
+        speed: int = 20,
+    ) -> None:
+        """Send a 3D zoom (area zoom) command to the PTZ camera.
+
+        The camera will pan, tilt, and zoom in a single motion to frame the specified rectangle.
+
+        Parameters:
+        pos_x (int): X coordinate of the center of the zoom box, in stream pixel coordinates.
+        pos_y (int): Y coordinate of the center of the zoom box, in stream pixel coordinates.
+        pos_width (int): Width of the zoom box in pixels. Smaller values = more zoom.
+        pos_height (int): Height of the zoom box in pixels. Smaller values = more zoom.
+        stream_width (int): Width of the video stream (default: mainStream width from Get3DPos).
+        stream_height (int): Height of the video stream (default: mainStream height from Get3DPos).
+        speed (int): Movement speed, 1-64 (default: 20).
+        """
+        if channel not in self._channels:
+            raise InvalidParameterError(f"set_ptz_3d_zoom: no camera connected to channel '{channel}'")
+        if not self.supported(channel, "ptz_3d_zoom"):
+            raise NotSupportedError(f"set_ptz_3d_zoom: 3D zoom on camera {self.camera_name(channel)} is not available")
+
+        if stream_width is None or stream_height is None:
+            range_data = self._ptz_3d_zoom_range.get(channel, {})
+            main_stream = range_data.get("mainStream", {})
+            if stream_width is None:
+                stream_width = main_stream.get("width")
+            if stream_height is None:
+                stream_height = main_stream.get("height")
+            if stream_width is None or stream_height is None:
+                raise InvalidParameterError(
+                    f"set_ptz_3d_zoom: stream resolution not available for camera {self.camera_name(channel)}, provide stream_width and stream_height explicitly"
+                )
+
+        for name, val in [("pos_x", pos_x), ("pos_y", pos_y), ("pos_width", pos_width), ("pos_height", pos_height)]:
+            if not isinstance(val, int):
+                raise InvalidParameterError(f"set_ptz_3d_zoom: {name} value {val} is not an integer")
+        if pos_width <= 0 or pos_height <= 0:
+            raise InvalidParameterError(f"set_ptz_3d_zoom: pos_width ({pos_width}) and pos_height ({pos_height}) must be positive")
+        if pos_x < 0 or pos_x > stream_width:
+            raise InvalidParameterError(f"set_ptz_3d_zoom: pos_x ({pos_x}) out of range 0..{stream_width}")
+        if pos_y < 0 or pos_y > stream_height:
+            raise InvalidParameterError(f"set_ptz_3d_zoom: pos_y ({pos_y}) out of range 0..{stream_height}")
+        if not 1 <= speed <= 64:
+            raise InvalidParameterError(f"set_ptz_3d_zoom: speed {speed} not in range 1..64")
+
+        body: typings.reolink_json = [
+            {
+                "cmd": "Set3DPos",
+                "action": 0,
+                "param": {
+                    "3DPos": {
+                        "channel": channel,
+                        "posX": pos_x,
+                        "posY": pos_y,
+                        "posWidth": pos_width,
+                        "posHeight": pos_height,
+                        "speed": speed,
+                        "width": stream_width,
+                        "height": stream_height,
+                    }
+                },
+            }
+        ]
+
+        await self.send_setting(body)
 
     def ptz_presets(self, channel: int) -> dict:
         if channel not in self._ptz_presets:
@@ -5254,6 +5364,10 @@ class Host:
 
         await self.send_setting(body)
 
+    # -------------------------------------------------------------------------
+    # Two-way audio (talk) public API
+    # -------------------------------------------------------------------------
+
     async def set_siren(self, channel: int | None = None, enable: bool = True, duration: int | None = 2) -> None:
         if channel not in self._channels and channel is not None:
             raise InvalidParameterError(f"set_siren: no camera connected to channel '{channel}'")
@@ -5691,6 +5805,165 @@ class Host:
 
         return statuses, vod_files
 
+    async def get_recording_days(self, channel: int, year: int, month: int) -> set[int]:
+        """Return the set of day-numbers (1–31) in *year*/*month* that have recordings.
+
+        Convenience wrapper around request_vod_files(status_only=True).
+        Useful for populating a calendar view in Home Assistant's media browser.
+
+        Example::
+
+            days = await host.get_recording_days(0, 2024, 6)
+            # {1, 3, 14, 15, 28}  → recordings exist on those days
+        """
+        if channel not in self._stream_channels:
+            raise InvalidParameterError(f"get_recording_days: no camera connected to channel '{channel}'")
+
+        if self.baichuan_only:
+            return await self.baichuan.search_recording_days_bc(channel, year, month)
+
+        last_day = calendar.monthrange(year, month)[1]
+        start = datetime(year, month, 1, 0, 0, 0)
+        end = datetime(year, month, last_day, 23, 59, 59)
+
+        statuses, _ = await self.request_vod_files(channel, start, end, status_only=True)
+
+        days: set[int] = set()
+        for status in statuses:
+            if status.year == year and status.month == month:
+                days.update(status.days)
+        return days
+
+    async def get_recordings_for_day(
+        self,
+        channel: int,
+        day: date,
+        stream: Optional[str] = None,
+        trigger: typings.VOD_trigger | None = None,
+    ) -> list[typings.VOD_file]:
+        """Return recordings for *channel* on the given *day*, sorted by start time.
+
+        Recordings are deduplicated so that the same file only appears once
+        even when it matches multiple detection triggers.
+
+        Parameters
+        ----------
+        channel:
+            Camera channel index.
+        day:
+            The calendar date to query (e.g. ``date(2024, 6, 14)``).
+        stream:
+            Stream type (``"main"``, ``"sub"``, …).  Defaults to the host default.
+        trigger:
+            Optional filter.  When given only recordings matching that
+            ``VOD_trigger`` flag are returned.
+
+        Returns
+        -------
+        list[VOD_file]
+            Sorted (by start_time), deduplicated list.  Each item exposes:
+
+            * ``file.start_time`` / ``file.end_time`` – datetime with tz
+            * ``file.duration`` – timedelta
+            * ``file.triggers`` – VOD_trigger flags (motion, person, …)
+            * ``file.file_name`` – filename for use with get_vod_source()
+            * ``file.size`` – file size in bytes
+
+            Obtain a playback URL with::
+
+                mime, url = await host.get_vod_source(channel, file.file_name)
+        """
+        if channel not in self._stream_channels:
+            raise InvalidParameterError(f"get_recordings_for_day: no camera connected to channel '{channel}'")
+
+        if self.baichuan_only:
+            vod_files = await self.baichuan.search_recordings_for_day_bc(channel, day, stream)
+            if trigger is not None:
+                vod_files = [f for f in vod_files if f.bc_triggers is not None and bool(f.bc_triggers & trigger)]
+            vod_files.sort(key=lambda f: f.start_time)
+            return vod_files
+
+        start = datetime(day.year, day.month, day.day, 0, 0, 0)
+        end = datetime(day.year, day.month, day.day, 23, 59, 59)
+
+        _, vod_files = await self.request_vod_files(channel, start, end, status_only=False, stream=stream, trigger=trigger)
+
+        # Deduplicate by file_name then sort chronologically
+        seen: set[str] = set()
+        unique: list[typings.VOD_file] = []
+        for f in vod_files:
+            key = f.file_name
+            if key not in seen:
+                seen.add(key)
+                unique.append(f)
+
+        unique.sort(key=lambda f: f.start_time)
+        return unique
+
+    def stream_recording_bc(
+        self,
+        channel: int,
+        file_name: str,
+        start_time: datetime,
+        stream_type: str = "mainStream",
+    ) -> AsyncIterator[tuple[int, bytes, str]]:
+        """Async generator: stream a VOD recording via the Baichuan protocol.
+
+        Yields ``(microseconds, video_bytes, codec)`` tuples for each video frame.
+        ``microseconds`` is the camera-relative timestamp (u32, wraps at ~71 min).
+        ``video_bytes`` is the raw video NAL data for the frame.
+        ``codec`` is ``"H264"`` or ``"H265"`` — detected from the BcMedia header and
+        overridden by NAL-level analysis when a firmware bug causes mislabelling.
+
+        Use this for baichuan_only cameras where HTTP download is unavailable.
+
+        Parameters
+        ----------
+        channel:
+            Camera channel index.
+        file_name:
+            Recording filename from ``get_recordings_for_day()``.
+        start_time:
+            Recording start time (from ``VOD_file.start_time``).
+        stream_type:
+            ``"mainStream"`` (default) or ``"subStream"``.
+
+        Usage::
+
+            async for microseconds, video_bytes, codec in host.stream_recording_bc(ch, name, start_time):
+                ...
+        """
+        return self.baichuan.parse_bcmedia_frames(self.baichuan.stream_replay_bc(channel, file_name, start_time, stream_type))
+
+    def stream_live_bc(
+        self,
+        channel: int,
+        stream_type: str = "mainStream",
+    ) -> AsyncIterator[tuple[int, bytes, str]]:
+        """Async generator: stream live video via the Baichuan protocol.
+
+        Yields ``(microseconds, video_bytes, codec)`` tuples for each video frame.
+        ``microseconds`` is the camera-relative timestamp (u32, wraps at ~71 min).
+        ``video_bytes`` is the raw video NAL data.
+        ``codec`` is ``"H264"`` or ``"H265"``.
+
+        Break out of the loop to stop the stream — the PreviewStop command is sent
+        automatically on generator close.
+
+        Parameters
+        ----------
+        channel:
+            Camera channel index.
+        stream_type:
+            ``"mainStream"`` (default) or ``"subStream"``.
+
+        Usage::
+
+            async for microseconds, video_bytes, codec in host.stream_live_bc(ch):
+                ...
+        """
+        return self.baichuan.parse_bcmedia_frames(self.baichuan.stream_live_bc(channel, stream_type))
+
     async def send_setting(self, body: typings.reolink_json, wait_before_get: int = 0, getcmd: str = "") -> None:
         command = body[0]["cmd"]
         _LOGGER.debug(
@@ -6025,7 +6298,7 @@ class Host:
                 err_mess = f"Expected type '{expected_content_type[0]}' but received '{response.content_type}'"
                 if response.content_type == "text/html":
                     if isinstance(data, bytes):
-                        data = data.decode("utf-8")
+                        data = data.decode("utf8")
                     err_mess = f"{err_mess}, response: {data}"
                 raise InvalidContentTypeError(err_mess)
 
@@ -6187,10 +6460,15 @@ class Host:
                 cmd_body = body[idx]
                 cmd = cmd_body.get("cmd", "")
                 rsp_code = cmd_data.get("error", {}).get("rspCode", 0)
+                args = cmd_body.get("param", {})
+                channel = args.get("channel")
+                if channel is not None and not self.camera_online(channel) and cmd != "GetChnTypeInfo":
+                    # GetChnTypeInfo needed to check camera_online
+                    _LOGGER.debug("Host %s: skipping baichuan fallback for %s of channel %s because it is offline", self._host, cmd, channel)
+                    continue
                 # check if baichuan has a fallback function
                 if cmd not in self.baichuan_cmds and cmd in self.baichuan.cmd_funcs and rsp_code in [-4, -9, -12, -13, -17]:
                     func = self.baichuan.cmd_funcs[cmd]
-                    args = cmd_body.get("param", {})
                     coroutines.append((idx, cmd, func(**args)))
                 elif rsp_code in [-12, -13, -17]:
                     # add to the list of cmds to retry
